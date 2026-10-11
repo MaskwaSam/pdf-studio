@@ -141,6 +141,108 @@ export interface PageContent {
   heightPt: number;
   texts: TextItem[];
   images: ImageItem[];
+  fields: FormField[];
+}
+
+// ---------- AcroForm fields ----------
+
+/** widget object number -> radio option index/value (from pdf-lib /Kids order) */
+export type RadioMeta = Map<number, { optionIndex: number; optionValue: string }>;
+
+export interface FormFieldOption {
+  exportValue: string;
+  displayValue: string;
+}
+
+export type FormFieldType = "text" | "multiline" | "checkbox" | "radio" | "combo" | "listbox";
+
+export interface FormField {
+  id: string;
+  pageIndex: number;
+  type: FormFieldType;
+  /** AcroForm field name — shared across widgets of one field */
+  name: string;
+  /** annotation rect in PDF user space [x1, y1, x2, y2] */
+  rect: [number, number, number, number];
+  readOnly: boolean;
+  /** current value: string (text/combo), boolean (checkbox), string[] (listbox) */
+  value: string | boolean | string[];
+  /** radio only: index of this widget's option in the group's option list */
+  optionIndex?: number;
+  /** radio only: export value of this widget's option */
+  optionValue?: string;
+  /** radio only: whether this widget is the selected one */
+  selected?: boolean;
+  options?: FormFieldOption[];
+  multiSelect?: boolean;
+}
+
+interface RawAnnotation {
+  id?: string;
+  subtype?: string;
+  fieldType?: string;
+  fieldName?: string;
+  fieldValue?: unknown;
+  buttonValue?: unknown;
+  exportValue?: string;
+  checkBox?: boolean;
+  radioButton?: boolean;
+  pushButton?: boolean;
+  combo?: boolean;
+  multiSelect?: boolean;
+  readOnly?: boolean;
+  multiLine?: boolean;
+  options?: FormFieldOption[];
+  rect?: number[];
+}
+
+export async function extractFormFields(
+  page: pdfjs.PDFPageProxy,
+  pageIndex: number,
+  radioMeta?: RadioMeta,
+): Promise<FormField[]> {
+  const anns = (await page.getAnnotations()) as RawAnnotation[];
+  const fields: FormField[] = [];
+  for (const a of anns) {
+    if (a.subtype !== "Widget" || !a.fieldName || !a.rect) continue;
+    const base = {
+      id: `${pageIndex}-${a.id ?? fields.length}`,
+      pageIndex,
+      name: a.fieldName,
+      rect: a.rect.slice(0, 4) as [number, number, number, number],
+      readOnly: !!a.readOnly,
+    };
+    if (a.fieldType === "Tx") {
+      fields.push({ ...base, type: a.multiLine ? "multiline" : "text", value: String(a.fieldValue ?? "") });
+    } else if (a.fieldType === "Btn" && a.checkBox) {
+      fields.push({ ...base, type: "checkbox", value: a.fieldValue !== "Off" && a.fieldValue != null && a.fieldValue !== false });
+    } else if (a.fieldType === "Btn" && a.radioButton) {
+      const meta = radioMeta?.get(parseInt(String(a.id), 10));
+      const fv = a.fieldValue;
+      const selected =
+        fv != null &&
+        fv !== "Off" &&
+        (String(fv) === String(a.buttonValue) || (meta && String(fv) === meta.optionValue));
+      fields.push({
+        ...base,
+        type: "radio",
+        optionIndex: meta?.optionIndex ?? 0,
+        optionValue: meta?.optionValue,
+        selected: !!selected,
+        value: "",
+      });
+    } else if (a.fieldType === "Ch") {
+      const fv = Array.isArray(a.fieldValue) ? a.fieldValue : a.fieldValue != null ? [a.fieldValue] : [];
+      fields.push({
+        ...base,
+        type: a.combo ? "combo" : "listbox",
+        options: a.options ?? [],
+        multiSelect: !!a.multiSelect,
+        value: a.multiSelect ? (fv as string[]) : String(fv[0] ?? ""),
+      });
+    }
+  }
+  return fields;
 }
 
 function cssFamilyToStem(fam: string): "helv" | "times" | "cour" {
@@ -149,7 +251,11 @@ function cssFamilyToStem(fam: string): "helv" | "times" | "cour" {
   return "helv";
 }
 
-export async function extractPageContent(page: pdfjs.PDFPageProxy, pageIndex: number): Promise<PageContent> {
+export async function extractPageContent(
+  page: pdfjs.PDFPageProxy,
+  pageIndex: number,
+  radioMeta?: RadioMeta,
+): Promise<PageContent> {
   const viewport = page.getViewport({ scale: 1 });
   const tc = await page.getTextContent();
   const texts: TextItem[] = [];
@@ -252,5 +358,7 @@ export async function extractPageContent(page: pdfjs.PDFPageProxy, pageIndex: nu
     }
   }
 
-  return { pageIndex, widthPt: viewport.width, heightPt: viewport.height, texts, images };
+  const fields = await extractFormFields(page, pageIndex, radioMeta);
+
+  return { pageIndex, widthPt: viewport.width, heightPt: viewport.height, texts, images, fields };
 }

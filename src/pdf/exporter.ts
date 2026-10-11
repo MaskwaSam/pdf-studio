@@ -12,8 +12,12 @@ import {
   lineTo,
   closePath,
   fill,
+  PDFName,
+  PDFArray,
+  PDFRef,
+  PDFRadioGroup,
 } from "pdf-lib";
-import type { RGB, PDFPage } from "pdf-lib";
+import type { RGB, PDFPage, PDFFont, PDFForm, PDFRef as PDFRefT } from "pdf-lib";
 import { matFromQuad } from "./model";
 import type { Quad, ImageItem, TextItem, PdfPoint } from "./model";
 
@@ -77,12 +81,160 @@ export interface AddTextEdit {
   textColor: Color;
 }
 
-export type Edit = TextEdit | ImageEdit | AddTextEdit;
+/** a signature/image stamp placed freely on a page */
+export interface StampEdit {
+  kind: "stamp";
+  id: string;
+  pageIndex: number;
+  quad: Quad;
+  imageBytes: Uint8Array; // PNG with alpha
+}
+
+export type Edit = TextEdit | ImageEdit | AddTextEdit | StampEdit;
+
+export type FormValue = string | boolean | string[] | null;
+
+export type Align = "left" | "center" | "right";
+
+export interface HeaderFooterSpec {
+  header: string;
+  footer: string;
+  headerAlign: Align;
+  footerAlign: Align;
+  fontSize: number;
+  margin: number;
+  color: Color;
+}
+
+export interface ExportExtras {
+  formValues?: Record<string, FormValue>;
+  headerFooter?: HeaderFooterSpec | null;
+}
+
+export interface RadioWidgetMeta {
+  optionIndex: number;
+  optionValue: string;
+}
 
 // ---------- export ----------
 
 function toRGB(c: Color): RGB {
   return rgb(c.r, c.g, c.b);
+}
+
+/**
+ * Map radio widget object numbers to their option index/value.
+ * pdf.js reports a radio widget's appearance state ("0","1") as buttonValue;
+ * pdf-lib needs the option value from the field's /Opt (kid order matches).
+ */
+export async function inspectFormDoc(bytes: Uint8Array): Promise<Map<number, RadioWidgetMeta>> {
+  const map = new Map<number, RadioWidgetMeta>();
+  try {
+    const doc = await PDFDocument.load(bytes.slice(), { updateMetadata: false });
+    const form = doc.getForm();
+    for (const f of form.getFields()) {
+      if (!(f instanceof PDFRadioGroup)) continue;
+      const opts = f.getOptions();
+      const kids = f.acroField.dict.get(PDFName.of("Kids"));
+      if (!(kids instanceof PDFArray)) continue;
+      for (let i = 0; i < kids.size(); i++) {
+        const k = kids.get(i);
+        if (k instanceof PDFRef && opts[i] !== undefined) {
+          map.set(k.objectNumber, { optionIndex: i, optionValue: opts[i] });
+        }
+      }
+    }
+  } catch {
+    // no form or unreadable — leave empty
+  }
+  return map;
+}
+
+/** Write collected overlay values into the doc's real AcroForm fields. */
+export function fillFormValues(
+  doc: PDFDocument,
+  values: Record<string, FormValue>,
+  font: PDFFont,
+): void {
+  let form: PDFForm;
+  try {
+    form = doc.getForm();
+  } catch {
+    return;
+  }
+  for (const [name, v] of Object.entries(values)) {
+    if (v === null || v === undefined) continue;
+    try {
+      if (typeof v === "boolean") {
+        const cb = form.getCheckBox(name);
+        if (v) cb.check();
+        else cb.uncheck();
+        continue;
+      }
+      if (Array.isArray(v)) {
+        try {
+          form.getOptionList(name).select(v);
+        } catch {
+          /* not an option list */
+        }
+        continue;
+      }
+      const s = String(v);
+      try {
+        form.getTextField(name).setText(s);
+        continue;
+      } catch {
+        /* not a text field */
+      }
+      try {
+        form.getRadioGroup(name).select(s);
+        continue;
+      } catch {
+        /* not a radio group */
+      }
+      try {
+        form.getDropdown(name).select(s);
+        continue;
+      } catch {
+        /* not a dropdown */
+      }
+      try {
+        form.getOptionList(name).select(s);
+      } catch {
+        /* no matching field */
+      }
+    } catch {
+      /* field missing entirely */
+    }
+  }
+  try {
+    form.updateFieldAppearances(font);
+  } catch {
+    /* appearance regen is best-effort */
+  }
+}
+
+function drawHeaderFooter(
+  pages: PDFPage[],
+  spec: HeaderFooterSpec,
+  font: PDFFont,
+): void {
+  const n = pages.length;
+  const subst = (s: string, i: number) =>
+    s.replaceAll("{page}", String(i + 1)).replaceAll("{pages}", String(n));
+  pages.forEach((p, i) => {
+    const w = p.getWidth(),
+      h = p.getHeight();
+    const draw = (raw: string, align: Align, y: number) => {
+      const t = subst(raw, i).trim();
+      if (!t) return;
+      const tw = font.widthOfTextAtSize(t, spec.fontSize);
+      const x = align === "left" ? spec.margin : align === "right" ? w - spec.margin - tw : (w - tw) / 2;
+      p.drawText(t, { x, y, size: spec.fontSize, font, color: toRGB(spec.color) });
+    };
+    if (spec.header) draw(spec.header, spec.headerAlign, h - spec.margin);
+    if (spec.footer) draw(spec.footer, spec.footerAlign, spec.margin);
+  });
 }
 
 /** Opaque cover over a quad, emitted in PDF user space (drawSvgPath y-flips SVG-space coords — don't use it). */
@@ -130,9 +282,22 @@ function letterboxQuad(quad: Quad, aspect: number): Quad {
   ];
 }
 
+function drawXObjectInQuad(page: PDFPage, imgRef: PDFRefT, quad: Quad, counter: number): void {
+  const m = matFromQuad(quad);
+  // newXObject appends a uniqueness suffix — use the name it returns
+  const name = page.node.newXObject(`PsImg${counter}`, imgRef);
+  page.pushOperators(
+    pushGraphicsState(),
+    concatTransformationMatrix(m[0], m[1], m[2], m[3], m[4], m[5]),
+    drawObject(name),
+    popGraphicsState(),
+  );
+}
+
 export async function exportPdf(
   sourceBytes: Uint8Array,
   edits: Edit[],
+  extrasArg?: ExportExtras,
 ): Promise<Uint8Array> {
   const doc = await PDFDocument.load(sourceBytes, { updateMetadata: false });
   const pages = doc.getPages();
@@ -189,17 +354,22 @@ export async function exportPdf(
           const aspect = img.width / img.height;
           quad = letterboxQuad(quad, aspect);
         }
-        const m = matFromQuad(quad);
-        // newXObject appends a uniqueness suffix — use the name it returns
-        const name = page.node.newXObject(`PsImg${imgCounter++}`, img.ref);
-        page.pushOperators(
-          pushGraphicsState(),
-          concatTransformationMatrix(m[0], m[1], m[2], m[3], m[4], m[5]),
-          drawObject(name),
-          popGraphicsState(),
-        );
+        drawXObjectInQuad(page, img.ref, quad, imgCounter++);
       }
+    } else if (edit.kind === "stamp") {
+      const img = await doc.embedPng(edit.imageBytes);
+      drawXObjectInQuad(page, img.ref, edit.quad, imgCounter++);
     }
+  }
+
+  const extras = extrasArg ?? {};
+  const needsUiFont =
+    (extras.formValues && Object.keys(extras.formValues).length > 0) ||
+    (extras.headerFooter && (extras.headerFooter.header || extras.headerFooter.footer));
+  if (needsUiFont) {
+    const uiFont = await getFont("helv", false);
+    if (extras.formValues) fillFormValues(doc, extras.formValues, uiFont);
+    if (extras.headerFooter) drawHeaderFooter(pages, extras.headerFooter, uiFont);
   }
 
   return doc.save();

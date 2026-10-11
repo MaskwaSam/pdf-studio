@@ -5,7 +5,17 @@ import type { Color, Edit, FontStem } from "./pdf/exporter";
 export const canvasRegistry = new Map<number, HTMLCanvasElement>();
 export const viewportRegistry = new Map<number, { transform: number[] }>();
 
-export type Tool = "edit" | "addtext";
+export type Tool = "edit" | "addtext" | "sign";
+
+/** AcroForm field name -> overlay value */
+export type FormValues = Record<string, string | boolean | string[] | null>;
+
+export interface Signature {
+  bytes: Uint8Array; // PNG with alpha
+  url: string;
+  /** drawn aspect ratio w/h */
+  aspect: number;
+}
 
 export interface TextDraft {
   kind: "text";
@@ -47,6 +57,7 @@ export type Draft = TextDraft | ImageDraft | AddTextDraft;
 export const textEditId = (itemId: string) => `et-${itemId}`;
 export const imageEditId = (itemId: string) => `ei-${itemId}`;
 export const addTextEditId = (page: number, n: number) => `ea-${page}-${n}`;
+export const stampEditId = (n: number) => `es-${n}`;
 
 export function upsertEdit(edits: Edit[], next: Edit): Edit[] {
   const i = edits.findIndex((e) => e.id === next.id);

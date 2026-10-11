@@ -1,6 +1,6 @@
 import React, { useRef } from "react";
-import type { Draft } from "../state";
-import type { Color, Edit } from "../pdf/exporter";
+import type { Draft, Signature } from "../state";
+import type { Color, Edit, HeaderFooterSpec } from "../pdf/exporter";
 
 const toHex = (c: Color) =>
   `#${[c.r, c.g, c.b].map((v) => Math.round(v * 255).toString(16).padStart(2, "0")).join("")}`;
@@ -20,6 +20,11 @@ interface Props {
   onRemoveEdit: (id: string) => void;
   onEditImageFile: (file: File) => void;
   onJumpToEdit: (pageIndex: number) => void;
+  signature: Signature | null;
+  signToolActive: boolean;
+  onDrawSignature: () => void;
+  headerFooter: HeaderFooterSpec;
+  onHeaderFooter: (h: HeaderFooterSpec) => void;
 }
 
 export default function Inspector(props: Props) {
@@ -180,6 +185,79 @@ export default function Inspector(props: Props) {
   return (
     <div className="inspector">
       {body ?? <div className="hint pad">Select text or an image to edit, or use a tool above.</div>}
+
+      <div className="editlist">
+        <div className="panel-title">Signature</div>
+        {props.signature ? (
+          <>
+            <img className="preview-img sig-thumb" src={props.signature.url} alt="signature" />
+            <div className="hint">{props.signToolActive ? "Click on the page to place it." : "Pick the Sign tool, then click the page."}</div>
+          </>
+        ) : (
+          <div className="hint">Draw a signature, then click the page to stamp it.</div>
+        )}
+        <div className="row btns">
+          <button onClick={props.onDrawSignature}>{props.signature ? "Redraw" : "Draw signature"}</button>
+        </div>
+      </div>
+
+      <div className="editlist">
+        <div className="panel-title">Header / footer</div>
+        <div className="row">
+          <label>Header</label>
+          <input
+            className="hf-input"
+            value={props.headerFooter.header}
+            onChange={(e) => props.onHeaderFooter({ ...props.headerFooter, header: e.target.value })}
+            placeholder="e.g. Confidential"
+          />
+          <select
+            value={props.headerFooter.headerAlign}
+            onChange={(e) => props.onHeaderFooter({ ...props.headerFooter, headerAlign: e.target.value as HeaderFooterSpec["headerAlign"] })}
+          >
+            <option value="left">Left</option>
+            <option value="center">Center</option>
+            <option value="right">Right</option>
+          </select>
+        </div>
+        <div className="row">
+          <label>Footer</label>
+          <input
+            className="hf-input"
+            value={props.headerFooter.footer}
+            onChange={(e) => props.onHeaderFooter({ ...props.headerFooter, footer: e.target.value })}
+            placeholder="e.g. Page {page} of {pages}"
+          />
+          <select
+            value={props.headerFooter.footerAlign}
+            onChange={(e) => props.onHeaderFooter({ ...props.headerFooter, footerAlign: e.target.value as HeaderFooterSpec["footerAlign"] })}
+          >
+            <option value="left">Left</option>
+            <option value="center">Center</option>
+            <option value="right">Right</option>
+          </select>
+        </div>
+        <div className="row">
+          <label>Size</label>
+          <input
+            type="number"
+            min={6}
+            max={36}
+            step={0.5}
+            value={props.headerFooter.fontSize}
+            onChange={(e) => props.onHeaderFooter({ ...props.headerFooter, fontSize: Math.max(1, +e.target.value || 9) })}
+          />
+          <label>Margin</label>
+          <input
+            type="number"
+            min={0}
+            max={200}
+            value={props.headerFooter.margin}
+            onChange={(e) => props.onHeaderFooter({ ...props.headerFooter, margin: Math.max(0, +e.target.value || 0) })}
+          />
+        </div>
+        <div className="hint">{"Use {page} and {pages} for page numbers."}</div>
+      </div>
       {editCount > 0 && (
         <div className="editlist">
           <div className="panel-title">Changes ({editCount})</div>
@@ -194,7 +272,9 @@ export default function Inspector(props: Props) {
                     ? e.imageBytes
                       ? "Replace image"
                       : "Delete image"
-                    : `Add "${truncate(e.text)}"`}
+                    : e.kind === "stamp"
+                      ? "Signature"
+                      : `Add "${truncate(e.text)}"`}
               </span>
               <span className="pgnum">p{e.pageIndex + 1}</span>
               <button className="x" onClick={() => props.onRemoveEdit(e.id)}>

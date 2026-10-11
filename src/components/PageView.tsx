@@ -4,10 +4,10 @@ import {
   extractPageContent,
   vpApply,
 } from "../pdf/model";
-import type { PageContent, TextItem, ImageItem, Quad } from "../pdf/model";
-import type { Edit, ImageEdit, TextEdit, AddTextEdit } from "../pdf/exporter";
+import type { PageContent, TextItem, ImageItem, Quad, FormField, RadioMeta } from "../pdf/model";
+import type { Edit, ImageEdit, TextEdit, AddTextEdit, HeaderFooterSpec } from "../pdf/exporter";
 import { canvasRegistry, viewportRegistry } from "../state";
-import type { Draft, Tool } from "../state";
+import type { Draft, Tool, FormValues } from "../state";
 
 const css = (c: { r: number; g: number; b: number }) =>
   `rgb(${Math.round(c.r * 255)},${Math.round(c.g * 255)},${Math.round(c.b * 255)})`;
@@ -55,10 +55,16 @@ interface Props {
   edits: Edit[];
   draft: Draft | null;
   matchItemIds: Set<string>;
+  radioMeta: RadioMeta;
+  formValues: FormValues;
+  headerFooter: HeaderFooterSpec | null;
+  numPages: number;
   onContent: (pageIndex: number, c: PageContent) => void;
   onTextItemClick: (item: TextItem) => void;
   onImageItemClick: (item: ImageItem) => void;
   onPageClick: (pageIndex: number, xPt: number, yPt: number) => void;
+  onSignClick: (pageIndex: number, xPt: number, yPt: number) => void;
+  onFormValue: (f: FormField, v: string | boolean | string[]) => void;
 }
 
 export default function PageView(props: Props) {
@@ -119,12 +125,13 @@ export default function PageView(props: Props) {
   useEffect(() => {
     if (props.content || !visible) return;
     let cancelled = false;
-    extractPageContent(page, pageIndex).then((c) => {
+    extractPageContent(page, pageIndex, props.radioMeta).then((c) => {
       if (!cancelled) props.onContent(pageIndex, c);
     });
     return () => {
       cancelled = true;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [page, pageIndex, visible, props.content]);
 
   const content = props.content;
@@ -132,11 +139,15 @@ export default function PageView(props: Props) {
   const draftHere = props.draft && (props.draft.kind === "addtext" ? props.draft.pageIndex === pageIndex : props.draft.item.pageIndex === pageIndex) ? props.draft : null;
 
   const handleCanvasClick = (ev: React.MouseEvent) => {
-    if (props.tool !== "addtext") return;
     const rect = (ev.currentTarget as HTMLElement).getBoundingClientRect();
     const x = ev.clientX - rect.left;
     const y = ev.clientY - rect.top;
     const [xPt, yPt] = viewport.convertToPdfPoint(x, y);
+    if (props.tool === "sign") {
+      props.onSignClick(pageIndex, xPt, yPt);
+      return;
+    }
+    if (props.tool !== "addtext") return;
     props.onPageClick(pageIndex, xPt, yPt);
   };
 
@@ -198,6 +209,18 @@ export default function PageView(props: Props) {
                 </React.Fragment>
               );
             }
+            if (e.kind === "stamp") {
+              const bg = quadCss(e.quad, scale, vpTransform);
+              return (
+                <img
+                  key={e.id}
+                  className="edit-image-preview"
+                  style={{ transform: bg, objectFit: "fill" }}
+                  src={URL.createObjectURL(new Blob([e.imageBytes.slice().buffer as ArrayBuffer]))}
+                  alt=""
+                />
+              );
+            }
             if (e.kind === "addtext") {
               const [cx, cy] = vpApply(vpTransform, e.xPt, e.yPt);
               return (
@@ -220,6 +243,147 @@ export default function PageView(props: Props) {
             }
             return null;
           })}
+
+          {/* AcroForm fields — interactive overlays above everything else */}
+          {content.fields.map((f) => {
+            const [x1, y1, x2, y2] = f.rect;
+            const p1 = vpApply(vpTransform, x1, y1),
+              p2 = vpApply(vpTransform, x2, y2);
+            const style: React.CSSProperties = {
+              left: Math.min(p1[0], p2[0]),
+              top: Math.min(p1[1], p2[1]),
+              width: Math.abs(p2[0] - p1[0]),
+              height: Math.abs(p2[1] - p1[1]),
+            };
+            const v = props.formValues[f.name];
+            const stop = (ev: React.SyntheticEvent) => ev.stopPropagation();
+            if (f.type === "checkbox") {
+              return (
+                <input
+                  key={f.id}
+                  type="checkbox"
+                  className="ff ff-check"
+                  style={style}
+                  disabled={f.readOnly}
+                  checked={v === undefined ? f.value === true : v === true}
+                  onClick={stop}
+                  onChange={(e) => props.onFormValue(f, e.target.checked)}
+                />
+              );
+            }
+            if (f.type === "radio") {
+              const opt = f.optionValue ?? String(f.optionIndex ?? 0);
+              return (
+                <input
+                  key={f.id}
+                  type="radio"
+                  className="ff ff-check"
+                  style={style}
+                  disabled={f.readOnly}
+                  checked={v === undefined ? !!f.selected : v === opt}
+                  onClick={stop}
+                  onChange={() => props.onFormValue(f, opt)}
+                />
+              );
+            }
+            if (f.type === "combo" || f.type === "listbox") {
+              const cur = v === undefined ? f.value : v;
+              return (
+                <select
+                  key={f.id}
+                  className="ff"
+                  style={{ ...style, fontSize: Math.max(8, style.height as number * 0.55) }}
+                  disabled={f.readOnly}
+                  multiple={f.type === "listbox" && !!f.multiSelect}
+                  value={cur as string | string[]}
+                  onClick={stop}
+                  onChange={(e) =>
+                    props.onFormValue(
+                      f,
+                      f.multiSelect
+                        ? Array.from(e.target.selectedOptions).map((o) => o.value)
+                        : e.target.value,
+                    )
+                  }
+                >
+                  {(f.options ?? []).map((o) => (
+                    <option key={o.exportValue} value={o.exportValue}>
+                      {o.displayValue}
+                    </option>
+                  ))}
+                </select>
+              );
+            }
+            const fsPx = Math.max(8, (style.height as number) * (f.type === "multiline" ? 0.4 : 0.6));
+            if (f.type === "multiline") {
+              return (
+                <textarea
+                  key={f.id}
+                  className="ff"
+                  style={{ ...style, fontSize: fsPx }}
+                  disabled={f.readOnly}
+                  value={v === undefined ? String(f.value ?? "") : String(v ?? "")}
+                  onClick={stop}
+                  onChange={(e) => props.onFormValue(f, e.target.value)}
+                />
+              );
+            }
+            return (
+              <input
+                key={f.id}
+                type="text"
+                className="ff"
+                style={{ ...style, fontSize: fsPx }}
+                disabled={f.readOnly}
+                value={v === undefined ? String(f.value ?? "") : String(v ?? "")}
+                onClick={stop}
+                onChange={(e) => props.onFormValue(f, e.target.value)}
+              />
+            );
+          })}
+
+          {/* header / footer preview */}
+          {props.headerFooter &&
+            (() => {
+              const hf = props.headerFooter;
+              const fpx = hf.fontSize * scale;
+              const subst = (s: string) =>
+                s.replaceAll("{page}", String(pageIndex + 1)).replaceAll("{pages}", String(props.numPages));
+              return (
+                <>
+                  {hf.header.trim() !== "" && (
+                    <div
+                      className="hf-preview"
+                      style={{
+                        top: hf.margin * scale - fpx * 1.15,
+                        left: hf.margin * scale,
+                        right: hf.margin * scale,
+                        fontSize: fpx,
+                        textAlign: hf.headerAlign,
+                        color: css(hf.color),
+                      }}
+                    >
+                      {subst(hf.header)}
+                    </div>
+                  )}
+                  {hf.footer.trim() !== "" && (
+                    <div
+                      className="hf-preview"
+                      style={{
+                        top: viewport.height - hf.margin * scale - fpx * 0.25,
+                        left: hf.margin * scale,
+                        right: hf.margin * scale,
+                        fontSize: fpx,
+                        textAlign: hf.footerAlign,
+                        color: css(hf.color),
+                      }}
+                    >
+                      {subst(hf.footer)}
+                    </div>
+                  )}
+                </>
+              );
+            })()}
 
           {/* find/replace match highlights */}
           {content.texts

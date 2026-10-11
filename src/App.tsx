@@ -1,23 +1,35 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as pdfjs from "pdfjs-dist";
-import { loadPdf, extractPageContent, vpApply } from "./pdf/model";
-import type { PageContent, TextItem, ImageItem, LoadedPdf } from "./pdf/model";
-import { exportPdf, sampleTextColors, sampleBgColor } from "./pdf/exporter";
-import type { Edit, TextEdit, ImageEdit, AddTextEdit } from "./pdf/exporter";
+import { loadPdf, extractPageContent, vpApply, quadFromBounds } from "./pdf/model";
+import type { PageContent, TextItem, ImageItem, LoadedPdf, FormField, RadioMeta } from "./pdf/model";
+import { exportPdf, sampleTextColors, sampleBgColor, inspectFormDoc } from "./pdf/exporter";
+import type { Edit, TextEdit, ImageEdit, AddTextEdit, StampEdit, HeaderFooterSpec } from "./pdf/exporter";
 import {
   canvasRegistry,
   viewportRegistry,
   textEditId,
   imageEditId,
   addTextEditId,
+  stampEditId,
   upsertEdit,
   removeEdit,
 } from "./state";
-import type { Draft, Tool } from "./state";
+import type { Draft, Tool, FormValues, Signature } from "./state";
 import PageView from "./components/PageView";
 import Thumbs from "./components/Thumbs";
 import Inspector from "./components/Inspector";
+import SignaturePad from "./components/SignaturePad";
 import "./styles.css";
+
+const defaultHF = (): HeaderFooterSpec => ({
+  header: "",
+  footer: "",
+  headerAlign: "center",
+  footerAlign: "center",
+  fontSize: 9,
+  margin: 36,
+  color: { r: 0.2, g: 0.2, b: 0.2 },
+});
 
 export default function App() {
   const [pdf, setPdf] = useState<LoadedPdf | null>(null);
@@ -35,7 +47,13 @@ export default function App() {
   const [replaceStr, setReplaceStr] = useState("");
   const [matchItemIds, setMatchItemIds] = useState<Set<string>>(new Set());
   const addCounter = useRef(0);
+  const stampCounter = useRef(0);
   const mainRef = useRef<HTMLDivElement>(null);
+  const [radioMeta, setRadioMeta] = useState<RadioMeta>(new Map());
+  const [formValues, setFormValues] = useState<FormValues>({});
+  const [signature, setSignature] = useState<Signature | null>(null);
+  const [padOpen, setPadOpen] = useState(false);
+  const [headerFooter, setHeaderFooter] = useState<HeaderFooterSpec>(defaultHF);
 
   const resetDoc = useCallback(() => {
     setEdits([]);
@@ -43,6 +61,9 @@ export default function App() {
     setContents({});
     contentsRef.current = {};
     setMatchItemIds(new Set());
+    setFormValues({});
+    setRadioMeta(new Map());
+    setHeaderFooter(defaultHF());
     canvasRegistry.clear();
     viewportRegistry.clear();
   }, []);
@@ -58,6 +79,7 @@ export default function App() {
         const arr: pdfjs.PDFPageProxy[] = [];
         for (let i = 1; i <= loaded.numPages; i++) arr.push(await loaded.doc.getPage(i));
         setPages(arr);
+        setRadioMeta(await inspectFormDoc(loaded.bytes));
       } catch (e) {
         alert(`Could not open PDF: ${e}`);
       } finally {
@@ -121,6 +143,33 @@ export default function App() {
     const bbox = canvasBboxForQuad(item.pageIndex, item.quad);
     const bg = canvas ? sampleBgColor(canvas, bbox) : { r: 1, g: 1, b: 1 };
     setDraft({ kind: "image", item, imageBytes: null, imageExt: "png", imagePreviewUrl: null, fit: "fill", bgColor: bg, deleteOnly: false });
+  }, []);
+
+  const onFormValue = useCallback((f: FormField, v: string | boolean | string[]) => {
+    setFormValues((m) => ({ ...m, [f.name]: v }));
+  }, []);
+
+  const onSignClick = useCallback(
+    (pageIndex: number, xPt: number, yPt: number) => {
+      if (!signature) return;
+      const w = 140,
+        h = w / signature.aspect;
+      const e: StampEdit = {
+        kind: "stamp",
+        id: stampEditId(stampCounter.current++),
+        pageIndex,
+        quad: quadFromBounds(xPt - w / 2, yPt - h / 2, xPt + w / 2, yPt + h / 2),
+        imageBytes: signature.bytes,
+      };
+      setEdits((es) => upsertEdit(es, e));
+    },
+    [signature],
+  );
+
+  const onSaveSignature = useCallback((bytes: Uint8Array, url: string, aspect: number) => {
+    setSignature({ bytes, url, aspect });
+    setPadOpen(false);
+    setTool("sign");
   }, []);
 
   const onPageClick = useCallback((pageIndex: number, xPt: number, yPt: number) => {
@@ -283,7 +332,7 @@ export default function App() {
     if (!pdf) return;
     setBusy(true);
     try {
-      const out = await exportPdf(pdf.bytes, edits);
+      const out = await exportPdf(pdf.bytes, edits, { formValues, headerFooter });
       const blob = new Blob([out.slice().buffer as ArrayBuffer], { type: "application/pdf" });
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
@@ -295,7 +344,7 @@ export default function App() {
     } finally {
       setBusy(false);
     }
-  }, [pdf, edits, fileName]);
+  }, [pdf, edits, fileName, formValues, headerFooter]);
 
   const jumpTo = (i: number) => {
     document.getElementById(`page-${i}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -322,6 +371,13 @@ export default function App() {
             </button>
             <button className={tool === "addtext" ? "btn on" : "btn"} onClick={() => setTool("addtext")}>
               + Text
+            </button>
+            <button
+              className={tool === "sign" ? "btn on" : "btn"}
+              onClick={() => (signature ? setTool("sign") : setPadOpen(true))}
+              title={signature ? "Click the page to stamp your signature" : "Draw a signature first"}
+            >
+              Sign
             </button>
             <button className={showFind ? "btn on" : "btn"} onClick={() => setShowFind(!showFind)}>
               Find / Replace
@@ -381,10 +437,16 @@ export default function App() {
                     edits={edits}
                     draft={draft}
                     matchItemIds={matchItemIds}
+                    radioMeta={radioMeta}
+                    formValues={formValues}
+                    headerFooter={headerFooter}
+                    numPages={pages.length}
                     onContent={onContent}
                     onTextItemClick={onTextItemClick}
                     onImageItemClick={onImageItemClick}
                     onPageClick={onPageClick}
+                    onSignClick={onSignClick}
+                    onFormValue={onFormValue}
                   />
                 </div>
               ))}
@@ -399,10 +461,16 @@ export default function App() {
               onRemoveEdit={onRemoveEdit}
               onEditImageFile={onEditImageFile}
               onJumpToEdit={jumpTo}
+              signature={signature}
+              signToolActive={tool === "sign"}
+              onDrawSignature={() => setPadOpen(true)}
+              headerFooter={headerFooter}
+              onHeaderFooter={setHeaderFooter}
             />
           </>
         )}
       </div>
+      {padOpen && <SignaturePad onSave={onSaveSignature} onCancel={() => setPadOpen(false)} />}
     </div>
   );
 }
