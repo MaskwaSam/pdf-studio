@@ -7,9 +7,14 @@ import {
   drawObject,
   pushGraphicsState,
   popGraphicsState,
+  setFillingRgbColor,
+  moveTo,
+  lineTo,
+  closePath,
+  fill,
 } from "pdf-lib";
-import type { RGB } from "pdf-lib";
-import { quadToSvgPath, matFromQuad } from "./model";
+import type { RGB, PDFPage } from "pdf-lib";
+import { matFromQuad } from "./model";
 import type { Quad, ImageItem, TextItem, PdfPoint } from "./model";
 
 export interface Color {
@@ -80,6 +85,22 @@ function toRGB(c: Color): RGB {
   return rgb(c.r, c.g, c.b);
 }
 
+/** Opaque cover over a quad, emitted in PDF user space (drawSvgPath y-flips SVG-space coords — don't use it). */
+function coverQuad(page: PDFPage, quad: Quad, color: Color): void {
+  const [bl, br, tr, tl] = quad;
+  page.pushOperators(
+    pushGraphicsState(),
+    setFillingRgbColor(color.r, color.g, color.b),
+    moveTo(bl.x, bl.y),
+    lineTo(br.x, br.y),
+    lineTo(tr.x, tr.y),
+    lineTo(tl.x, tl.y),
+    closePath(),
+    fill(),
+    popGraphicsState(),
+  );
+}
+
 /**
  * Shrink `quad` along one axis so the result has aspect `aspect` (w/h), centered.
  * The quad maps a unit square: u-axis = BL->BR (width), v-axis = BL->TL (height).
@@ -134,7 +155,7 @@ export async function exportPdf(
 
     if (edit.kind === "text") {
       // cover original glyphs
-      page.drawSvgPath(quadToSvgPath(edit.item.quad), { color: toRGB(edit.bgColor) });
+      coverQuad(page, edit.item.quad, edit.bgColor);
       if (edit.newText && edit.newText.length > 0) {
         const font = await getFont(edit.fontStem, edit.bold);
         page.drawText(edit.newText, {
@@ -157,7 +178,7 @@ export async function exportPdf(
       });
     } else if (edit.kind === "image") {
       // cover the original quad (bgColor only needed in fit mode, cheap anyway)
-      page.drawSvgPath(quadToSvgPath(edit.item.quad), { color: toRGB(edit.bgColor) });
+      coverQuad(page, edit.item.quad, edit.bgColor);
       if (edit.imageBytes) {
         const img =
           edit.imageExt === "jpg"

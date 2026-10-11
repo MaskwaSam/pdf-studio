@@ -12,6 +12,10 @@ import type { Draft, Tool } from "../state";
 const css = (c: { r: number; g: number; b: number }) =>
   `rgb(${Math.round(c.r * 255)},${Math.round(c.g * 255)},${Math.round(c.b * 255)})`;
 
+// pdf.js forbids concurrent render() calls on one canvas; serialize per canvas
+// so cleanup/StrictMode re-runs never touch a canvas mid-paint (displayed-texture corruption)
+const renderQueue = new WeakMap<HTMLCanvasElement, Promise<unknown>>();
+
 export const stemToCss = (s: string) =>
   s === "times" ? '"Times New Roman", Times, serif' : s === "cour" ? '"Courier New", Courier, monospace' : 'Helvetica, Arial, sans-serif';
 
@@ -82,19 +86,33 @@ export default function PageView(props: Props) {
     viewportRegistry.set(pageIndex, { transform: vpTransform });
   }, [pageIndex, vpTransform, visible]);
 
-  // render
+  // render (serialized per canvas — see renderQueue above)
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || !visible) return;
+    let cancelled = false;
     const dpr = window.devicePixelRatio || 1;
     const renderVp = page.getViewport({ scale: scale * dpr });
-    canvas.width = Math.ceil(renderVp.width);
-    canvas.height = Math.ceil(renderVp.height);
-    canvas.style.width = `${viewport.width}px`;
-    canvas.style.height = `${viewport.height}px`;
     const ctx = canvas.getContext("2d")!;
-    const task = page.render({ canvas, canvasContext: ctx, viewport: renderVp });
-    return () => task.cancel();
+    let task: pdfjs.RenderTask | null = null;
+    const prev = renderQueue.get(canvas) ?? Promise.resolve();
+    const current = prev
+      .catch(() => {})
+      .then(() => {
+        if (cancelled) return;
+        canvas.width = Math.ceil(renderVp.width);
+        canvas.height = Math.ceil(renderVp.height);
+        canvas.style.width = `${viewport.width}px`;
+        canvas.style.height = `${viewport.height}px`;
+        task = page.render({ canvas, canvasContext: ctx, viewport: renderVp });
+        return task.promise;
+      })
+      .catch(() => {});
+    renderQueue.set(canvas, current);
+    return () => {
+      cancelled = true;
+      task?.cancel();
+    };
   }, [page, scale, visible]);
 
   // extract content lazily once
